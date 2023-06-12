@@ -3,7 +3,7 @@ import rclpy
 import rclpy.time
 from rclpy.duration import Duration
 import rclpy.action
-from rclpy.action.client import GoalStatus
+from rclpy.action.client import GoalStatus, ClientGoalHandle
 
 import threading
 import traceback
@@ -214,6 +214,7 @@ class SimpleActionState(RosState):
 
         # Construct action client, and wait for it to come active
         self._action_client = rclpy.action.ActionClient(self.node, action_spec, action_name)
+        self._goal_handle : ClientGoalHandle = None
 
         self._execution_timer_thread = None
         # Condition variables for threading synchronization
@@ -232,7 +233,8 @@ class SimpleActionState(RosState):
             if clock.now() - self._activate_time > self._exec_timeout:
                 self.node.get_logger().warn("Action %s timed out after %d seconds." % (self._action_name, self._exec_timeout.to_sec()))
                 # Cancel the goal
-                self._action_client.cancel_goal()
+                if self._goal_handle:
+                    self._goal_handle.cancel_goal_async()
 
     ### smach State API
     def request_preempt(self):
@@ -241,7 +243,8 @@ class SimpleActionState(RosState):
         if self._status == SimpleActionState.ACTIVE:
             self.node.get_logger().info("Preempt on action '%s' cancelling goal: \n%s" % (self._action_name, str(self._goal)))
             # Cancel the goal
-            self._action_client.cancel_goal()
+            if self._goal_handle:
+                self._goal_handle.cancel_goal_async()
 
     def execute(self, ud):
         """Called when executing a state.
@@ -318,7 +321,7 @@ class SimpleActionState(RosState):
         self._done_cond.acquire()
         send_future = self._action_client.send_goal_async(self._goal, feedback_callback=self._goal_feedback_cb)
         send_future.add_done_callback(self._goal_active_cb)
-
+        
         # Preempt timeout watch thread
         if self._exec_timeout:
             self._execution_timer_thread = threading.Thread(name=self._action_name+'/preempt_watchdog', target=self._execution_timer)
@@ -386,6 +389,7 @@ class SimpleActionState(RosState):
         This callback starts the timer that watches for the timeout specified for this action.
         """
         gh = future.result()
+        self._goal_handle = gh
         if not gh.accepted:
             self.node.get_logger().debug("Action "+self._action_name+" has been rejected!")
             return
@@ -410,6 +414,7 @@ class SimpleActionState(RosState):
                 return 'UNKNOWN ('+str(i)+')'
 
         gh = future.result()
+        self._goal_handle = gh
 
         # Calculate duration
         self._duration = self.node.get_clock().now() - self._activate_time

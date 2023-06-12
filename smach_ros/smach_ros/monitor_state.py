@@ -46,6 +46,8 @@ class MonitorState(RosState):
 
         self._sub = self.node.create_subscription(self._msg_type,
             self._topic, self._cb, 1)
+        
+        self._ud = None
 
     def execute(self, ud):
         # If prempted before even getting a chance, give up.
