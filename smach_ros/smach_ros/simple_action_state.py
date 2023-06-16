@@ -51,7 +51,11 @@ class SimpleActionState(RosState):
             # Timeouts
             exec_timeout = None,
             preempt_timeout = Duration(seconds=60.0),
-            server_wait_timeout = Duration(seconds=60.0)
+            server_wait_timeout = Duration(seconds=60.0),
+            #Feedback
+            feedback_cb = None,
+            feedback_cb_args = [],
+            feedback_cb_kwargs = {},
             ):
         """Constructor for SimpleActionState action client wrapper.
 
@@ -114,6 +118,12 @@ class SimpleActionState(RosState):
         @type server_wait_timeout: C{rclpy.time.Duration}
         @param server_wait_timeout: This is the timeout used for aborting while
         waiting for an action server to become active.
+        
+        @type feedback_cb: callable
+        @param feedback_cb: This callback will be called with the feedback
+        from the action server. The callback is passed two parameters:
+            - userdata (L{UserData<smach.user_data.UserData>})
+            - feedback (actionlib feedback msg)
         """
 
         # Initialize base class
@@ -167,6 +177,24 @@ class SimpleActionState(RosState):
         else:
             self._goal_cb_input_keys = input_keys
             self._goal_cb_output_keys = output_keys
+            
+        ### FEEDBACK    
+        if feedback_cb and not hasattr(feedback_cb, '__call__'):
+            raise smach.InvalidStateError("Feedback callback object given to SimpleActionState that IS NOT a function object")
+        self._feedback_cb = feedback_cb
+        self._feedback_cb_args = feedback_cb_args
+        self._feedback_cb_kwargs = feedback_cb_kwargs
+        if smach.has_smach_interface(feedback_cb):
+            self._feedback_cb_input_keys = feedback_cb.get_registered_input_keys()
+            self._feedback_cb_output_keys = feedback_cb.get_registered_output_keys()
+
+            self.register_input_keys(self._feedback_cb_input_keys)
+            self.register_output_keys(self._feedback_cb_output_keys)
+        else:
+            self._feedback_cb_input_keys = input_keys
+            self._feedback_cb_output_keys = output_keys
+        ### FEEDBACK    
+
 
         # Set result processing policy
         if result_cb and not hasattr(result_cb, '__call__'):
@@ -319,6 +347,7 @@ class SimpleActionState(RosState):
 
         # Wait on done condition
         self._done_cond.acquire()
+        self._ud = ud
         send_future = self._action_client.send_goal_async(self._goal, feedback_callback=self._goal_feedback_cb)
         send_future.add_done_callback(self._goal_active_cb)
         
@@ -399,6 +428,16 @@ class SimpleActionState(RosState):
     def _goal_feedback_cb(self, feedback):
         """Goal Feedback Callback"""
         self.node.get_logger().debug("Action "+self._action_name+" sent feedback {}".format(feedback))
+        if self._feedback_cb is not None:
+            self._feedback_cb(
+                smach.Remapper(
+                    self._ud,
+                    self._feedback_cb_input_keys,
+                    self._feedback_cb_output_keys,
+                    []),
+                feedback,
+                *self._feedback_cb_args,
+                **self._feedback_cb_kwargs)
 
     def _goal_done_cb(self, future):
         """Goal Done Callback
