@@ -5,6 +5,8 @@ from rclpy.duration import Duration
 import rclpy.action
 from rclpy.action.client import GoalStatus, ClientGoalHandle
 
+import time
+
 import threading
 import traceback
 
@@ -51,11 +53,7 @@ class SimpleActionState(RosState):
             # Timeouts
             exec_timeout = None,
             preempt_timeout = Duration(seconds=60.0),
-            server_wait_timeout = Duration(seconds=60.0),
-            #Feedback
-            feedback_cb = None,
-            feedback_cb_args = [],
-            feedback_cb_kwargs = {},
+            server_wait_timeout = Duration(seconds=60.0)
             ):
         """Constructor for SimpleActionState action client wrapper.
 
@@ -118,12 +116,6 @@ class SimpleActionState(RosState):
         @type server_wait_timeout: C{rclpy.time.Duration}
         @param server_wait_timeout: This is the timeout used for aborting while
         waiting for an action server to become active.
-        
-        @type feedback_cb: callable
-        @param feedback_cb: This callback will be called with the feedback
-        from the action server. The callback is passed two parameters:
-            - userdata (L{UserData<smach.user_data.UserData>})
-            - feedback (actionlib feedback msg)
         """
 
         # Initialize base class
@@ -177,24 +169,6 @@ class SimpleActionState(RosState):
         else:
             self._goal_cb_input_keys = input_keys
             self._goal_cb_output_keys = output_keys
-            
-        ### FEEDBACK    
-        if feedback_cb and not hasattr(feedback_cb, '__call__'):
-            raise smach.InvalidStateError("Feedback callback object given to SimpleActionState that IS NOT a function object")
-        self._feedback_cb = feedback_cb
-        self._feedback_cb_args = feedback_cb_args
-        self._feedback_cb_kwargs = feedback_cb_kwargs
-        if smach.has_smach_interface(feedback_cb):
-            self._feedback_cb_input_keys = feedback_cb.get_registered_input_keys()
-            self._feedback_cb_output_keys = feedback_cb.get_registered_output_keys()
-
-            self.register_input_keys(self._feedback_cb_input_keys)
-            self.register_output_keys(self._feedback_cb_output_keys)
-        else:
-            self._feedback_cb_input_keys = input_keys
-            self._feedback_cb_output_keys = output_keys
-        ### FEEDBACK    
-
 
         # Set result processing policy
         if result_cb and not hasattr(result_cb, '__call__'):
@@ -242,7 +216,6 @@ class SimpleActionState(RosState):
 
         # Construct action client, and wait for it to come active
         self._action_client = rclpy.action.ActionClient(self.node, action_spec, action_name)
-        self._goal_handle : ClientGoalHandle = None
 
         self._execution_timer_thread = None
         # Condition variables for threading synchronization
@@ -261,8 +234,7 @@ class SimpleActionState(RosState):
             if clock.now() - self._activate_time > self._exec_timeout:
                 self.node.get_logger().warn("Action %s timed out after %d seconds." % (self._action_name, self._exec_timeout.to_sec()))
                 # Cancel the goal
-                if self._goal_handle:
-                    self._goal_handle.cancel_goal_async()
+                self.gh.cancel_goal_async()
 
     ### smach State API
     def request_preempt(self):
@@ -271,8 +243,8 @@ class SimpleActionState(RosState):
         if self._status == SimpleActionState.ACTIVE:
             self.node.get_logger().info("Preempt on action '%s' cancelling goal: \n%s" % (self._action_name, str(self._goal)))
             # Cancel the goal
-            if self._goal_handle:
-                self._goal_handle.cancel_goal_async()
+            self.gh.cancel_goal_async()
+
 
     def execute(self, ud):
         """Called when executing a state.
@@ -347,17 +319,32 @@ class SimpleActionState(RosState):
 
         # Wait on done condition
         self._done_cond.acquire()
-        self._ud = ud
         send_future = self._action_client.send_goal_async(self._goal, feedback_callback=self._goal_feedback_cb)
         send_future.add_done_callback(self._goal_active_cb)
-        
+
         # Preempt timeout watch thread
         if self._exec_timeout:
             self._execution_timer_thread = threading.Thread(name=self._action_name+'/preempt_watchdog', target=self._execution_timer)
             self._execution_timer_thread.start()
 
-        # Wait for action to finish
-        self._done_cond.wait()
+    #   Wait for action to finish
+        # self._done_cond.wait()
+
+        while self._action_client.server_is_ready():
+
+            if self.preempt_requested():
+                self.service_preempt()
+                self.node.get_logger().warn("Preempting while waiting for goal to finish.")
+                break
+    
+            if self._done_cond.wait(3.0): 
+                #Waiting needs at least 1 sec; any shorter will cause deadlock
+                #This means that the node will stop waiting only at least 3s from server going down
+                break
+
+        if not rclpy.ok() or not self._action_client.server_is_ready():
+            self.node.get_logger().warn("Action server is no longer up, or  rclpy is not ok")
+            
 
         # Call user result callback if defined
         result_cb_outcome = None
@@ -381,8 +368,10 @@ class SimpleActionState(RosState):
         if self._result_key is not None:
             ud[self._result_key] = self._goal_result
 
-        for key in self._result_slots:
-            ud[key] = getattr(self._goal_result, key)
+        # Goal might be None, for instance if goal was LOST.
+        if self._goal_result is not None:
+            for key in self._result_slots:
+                ud[key] = getattr(self._goal_result, key)
 
         # Check status
         if self._status == SimpleActionState.INACTIVE:
@@ -417,27 +406,17 @@ class SimpleActionState(RosState):
         """Goal Active Callback
         This callback starts the timer that watches for the timeout specified for this action.
         """
-        gh = future.result()
-        self._goal_handle = gh
-        if not gh.accepted:
+        print("Goal active!")
+        self.gh : ClientGoalHandle = future.result()
+        if not self.gh.accepted:
             self.node.get_logger().debug("Action "+self._action_name+" has been rejected!")
             return
-        result_future = gh.get_result_async()
+        result_future = self.gh.get_result_async()
         result_future.add_done_callback(self._goal_done_cb)
 
     def _goal_feedback_cb(self, feedback):
         """Goal Feedback Callback"""
         self.node.get_logger().debug("Action "+self._action_name+" sent feedback {}".format(feedback))
-        if self._feedback_cb is not None:
-            self._feedback_cb(
-                smach.Remapper(
-                    self._ud,
-                    self._feedback_cb_input_keys,
-                    self._feedback_cb_output_keys,
-                    []),
-                feedback,
-                *self._feedback_cb_args,
-                **self._feedback_cb_kwargs)
 
     def _goal_done_cb(self, future):
         """Goal Done Callback
@@ -445,6 +424,7 @@ class SimpleActionState(RosState):
         Also, if the user has defined a result_cb, it is called here before the
         method returns.
         """
+        
         def get_result_str(i):
             strs = ('STATUS_UNKONWN','STATUS_ACCEPTED','STATUS_EXECUTING','STATUS_CANCELING','STATUS_SUCCEEDED','STATUS_CANCELED','STATUS_ABORTED')
             if i < len(strs):
@@ -452,18 +432,17 @@ class SimpleActionState(RosState):
             else:
                 return 'UNKNOWN ('+str(i)+')'
 
-        gh = future.result()
-        self._goal_handle = gh
+        self.gh = future.result()
 
         # Calculate duration
         self._duration = self.node.get_clock().now() - self._activate_time
         self.node.get_logger().debug("Action "+self._action_name+" terminated after "\
                 +str(self._duration)+" nanoseconds with result "\
-                +get_result_str(gh.status)+".")
+                +get_result_str(self.gh.status)+".")
 
         # Store goal state
-        self._goal_status = gh.status
-        self._goal_result = gh.result
+        self._goal_status = self.gh.status
+        self._goal_result = self.gh.result
 
         # Rest status
         self._status = SimpleActionState.INACTIVE
@@ -472,3 +451,5 @@ class SimpleActionState(RosState):
         self._done_cond.acquire()
         self._done_cond.notify()
         self._done_cond.release()
+        print("GOAL SUCCEEDED, ")
+
