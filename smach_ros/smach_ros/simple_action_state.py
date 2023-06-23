@@ -53,7 +53,11 @@ class SimpleActionState(RosState):
             # Timeouts
             exec_timeout = None,
             preempt_timeout = Duration(seconds=60.0),
-            server_wait_timeout = Duration(seconds=60.0)
+            server_wait_timeout = Duration(seconds=60.0),
+            
+            #feedback
+            feedback_cb = None
+            
             ):
         """Constructor for SimpleActionState action client wrapper.
 
@@ -193,6 +197,11 @@ class SimpleActionState(RosState):
             self._result_cb_input_keys = input_keys
             self._result_cb_output_keys = output_keys
             self._result_cb_outcomes = outcomes
+            
+        
+        #FEEDBACK
+        self.user_feedback_cb = feedback_cb
+            
 
         # Result to userdata key
         self._result_key = result_key
@@ -220,6 +229,8 @@ class SimpleActionState(RosState):
         self._execution_timer_thread = None
         # Condition variables for threading synchronization
         self._done_cond = threading.Condition()
+        
+        self.gh : ClientGoalHandle = None
 
     def _execution_timer(self):
         """Internal method for cancelling a timed out goal after a timeout."""
@@ -234,7 +245,8 @@ class SimpleActionState(RosState):
             if clock.now() - self._activate_time > self._exec_timeout:
                 self.node.get_logger().warn("Action %s timed out after %d seconds." % (self._action_name, self._exec_timeout.to_sec()))
                 # Cancel the goal
-                self.gh.cancel_goal_async()
+                if self.gh: #This state may be premmpted BEFORE a server is ready/goal is accepted 
+                    self.gh.cancel_goal_async()
 
     ### smach State API
     def request_preempt(self):
@@ -243,7 +255,8 @@ class SimpleActionState(RosState):
         if self._status == SimpleActionState.ACTIVE:
             self.node.get_logger().info("Preempt on action '%s' cancelling goal: \n%s" % (self._action_name, str(self._goal)))
             # Cancel the goal
-            self.gh.cancel_goal_async()
+            if self.gh: #This state may be premmpted BEFORE a server is ready/goal is accepted 
+                self.gh.cancel_goal_async()
 
 
     def execute(self, ud):
@@ -331,11 +344,13 @@ class SimpleActionState(RosState):
         # self._done_cond.wait()
 
         while self._action_client.server_is_ready():
-
+            
             if self.preempt_requested():
+                self.request_preempt()
                 self.service_preempt()
-                self.node.get_logger().warn("Preempting while waiting for goal to finish.")
-                break
+                self._status = SimpleActionState.INACTIVE
+                self._done_cond.release()
+                return 'preempted'
     
             if self._done_cond.wait(3.0): 
                 #Waiting needs at least 1 sec; any shorter will cause deadlock
@@ -344,8 +359,9 @@ class SimpleActionState(RosState):
 
         if not rclpy.ok() or not self._action_client.server_is_ready():
             self.node.get_logger().warn("Action server is no longer up, or  rclpy is not ok")
+            self._status = SimpleActionState.INACTIVE
+            return 'aborted'
             
-
         # Call user result callback if defined
         result_cb_outcome = None
         if self._result_cb is not None:
@@ -417,6 +433,10 @@ class SimpleActionState(RosState):
     def _goal_feedback_cb(self, feedback):
         """Goal Feedback Callback"""
         self.node.get_logger().debug("Action "+self._action_name+" sent feedback {}".format(feedback))
+        
+        if self.user_feedback_cb is not None:
+            self.user_feedback_cb(feedback)
+        
 
     def _goal_done_cb(self, future):
         """Goal Done Callback
@@ -451,5 +471,4 @@ class SimpleActionState(RosState):
         self._done_cond.acquire()
         self._done_cond.notify()
         self._done_cond.release()
-        print("GOAL SUCCEEDED, ")
 
